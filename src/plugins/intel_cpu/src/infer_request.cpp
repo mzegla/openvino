@@ -83,9 +83,24 @@ void SyncInferRequest::redefine_memory_for_input_nodes(Graph& graph) {
     for (const auto& input_port : m_input_ports_map) {
         auto inputNode = graph.getInputNodeByIndex(input_port.first);
         OPENVINO_ASSERT(inputNode, "CPU execution graph doesn't contain input node with index: ", input_port.first);
+        const auto& tensor = get_tensor_ptr(input_port.second);
+        const auto tensorShape = tensor->get_shape();
+        // [RDI] diagnostic: print each input node's name, isDynamic, and tensor shape
+        {
+            std::string shapeStr = "[";
+            for (size_t i = 0; i < tensorShape.size(); ++i) {
+                if (i) shapeStr += ",";
+                shapeStr += std::to_string(tensorShape[i]);
+            }
+            shapeStr += "]";
+            fprintf(stderr, "[RDI] idx=%zu name='%s' isDyn=%d tensorShape=%s\n",
+                    input_port.first,
+                    inputNode->getName().c_str(),
+                    (int)inputNode->isDynamicNode(),
+                    shapeStr.c_str());
+        }
         if (inputNode->isDynamicNode()) {
-            const auto& tensor = get_tensor_ptr(input_port.second);
-            inputNode->redefineOutputMemory({tensor->get_shape()});
+            inputNode->redefineOutputMemory({tensorShape});
         }
     }
 }
@@ -138,14 +153,26 @@ void SyncInferRequest::infer() {
 
     throw_if_canceled();
 
-    // update output control blocks, if any, in order to refresh internal buffers
+    // Pull output data BEFORE rotating the output control block buffers.
+    // OutputControlBlock::update() calls setMemBlockResize(currentMemBlock()), which resizes
+    // the underlying MemoryBlockWithReuse to control_block.m_proxyMemBlock.m_size.  When the
+    // graph was compiled with zero-dim placeholder input shapes, that stored size is 0 — so
+    // update() would call resize(0) and destroy the data the graph just wrote to m_buffers[0].
+    // Pulling the output first preserves the data.  update() is only needed to rotate the
+    // double-buffer ready for the NEXT inference call, so calling it after is correct.
+    graph.PullOutputData(m_outputs);
+
+    // Rotate output control block buffers for the next inference call.
     if (graph.IsDynamic()) {
         for (auto&& item : m_outputControlBlocks) {
             item.second.update();
         }
     }
-
-    graph.PullOutputData(m_outputs);
+    // Diagnostic: print all output data ptrs after everything
+    for (auto& kv : m_outputs) {
+        void* ptr = kv.second ? kv.second->data() : nullptr;
+        fprintf(stderr, "[OV-DBG-OUT] m_outputs[%zu] ptr=%p\n", kv.first, ptr);
+    }
 }
 
 std::vector<ov::ProfilingInfo> SyncInferRequest::get_profiling_info() const {
@@ -367,7 +394,16 @@ void SyncInferRequest::set_tensor(const ov::Output<const ov::Node>& in_port, con
     // BlockingDesc, so to construct new tensor with original tensor's data, which is only for ov legacy api usage.
     if (in_port.get_partial_shape().is_static() && in_tensor->get_size() > 0 && in_tensor->get_shape().empty() &&
         in_tensor->get_size() == ov::shape_size(in_port.get_shape()) && !in_port.get_shape().empty()) {
-        tensor = ov::make_tensor(in_tensor->get_element_type(), in_port.get_shape(), in_tensor->data());
+        // Guard: data() may be null for ProxyMemoryBlock-backed tensors (e.g. PA stub outputs)
+        // that have not yet allocated their underlying storage. Skip the WA in that case.
+        if (in_tensor->data() != nullptr) {
+            tensor = ov::make_tensor(in_tensor->get_element_type(), in_port.get_shape(), in_tensor->data());
+        } else {
+            fprintf(stderr, "[OV-DBG] set_tensor WA skipped null data for port '%s' shape=%s size=%zu\n",
+                    in_port.get_any_name().c_str(),
+                    in_port.get_partial_shape().to_string().c_str(),
+                    (size_t)in_tensor->get_size());
+        }
     }
     auto port_found = find_port(in_port);
     auto mem_desc_ptr = MemoryDescUtils::generateCpuBlockedMemoryDesc(tensor);

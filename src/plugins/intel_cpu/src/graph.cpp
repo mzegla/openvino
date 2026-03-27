@@ -1264,13 +1264,20 @@ void Graph::PullOutputData(std::unordered_map<std::size_t, ov::SoPtr<ITensor>>& 
         // TODO [NM]: need to create a universal reorder which will detect cases when we really need to use it
         // WA: for cases when output shape after transformation is 1x1x1x1 but the model output is scalar
         const auto& actualDims = ext_blob->get_shape();
-        const auto& outDims = intr_blob.getStaticDims();
+        // Guard: skip stub outputs with undefined/dynamic shape (e.g. PA KV-cache stub outputs).
+        // These are internal paged-attention outputs not meant to be returned to the user.
+        if (!intr_blob.getDesc().isDefined()) {
+            fprintf(stderr, "[OV-DBG-PO] output[%zu] node='%s' intr UNDEFINED -> skip\n",
+                    output_index, node->getName().c_str());
+            continue;
+        }
+        // Use getDims() instead of getStaticDims() — works for ShapeType::Dynamic nodes
+        // with fully-known dims (which is common for outputs in a dynamic graph).
+        const auto& outDims = intr_blob.getDesc().getShape().getDims();
 
         const bool isScalarOutput = actualDims.empty() && 1 == ext_blob->get_size();
 
         if (!isScalarOutput && actualDims != outDims) {
-            // WA: because input/output info initially contains non empty dims, order etc.
-            // and setDims (called inside setShape) can't correct modify blocked desc for desc with blocked layout
             DEBUG_LOG(output_index,
                       ", tensor data addr ",
                       static_cast<void*>(output[output_index]->data()),
@@ -1282,6 +1289,11 @@ void Graph::PullOutputData(std::unordered_map<std::size_t, ov::SoPtr<ITensor>>& 
                       intr_blob.getData(),
                       " , parentedge's memory object ",
                       parentEdge->getMemoryPtr().get());
+            fprintf(stderr, "[OV-DBG-PO] output[%zu] set_shape %s -> [%zu,%zu,...]\n",
+                    output_index,
+                    PartialShape(actualDims).to_string().c_str(),
+                    outDims.size() > 0 ? outDims[0] : 0,
+                    outDims.size() > 1 ? outDims[1] : 0);
             ext_blob->set_shape(outDims);
             DEBUG_LOG(output_index,
                       ", tensor data addr ",
@@ -1310,6 +1322,28 @@ void Graph::PullOutputData(std::unordered_map<std::size_t, ov::SoPtr<ITensor>>& 
 
         void* ext_blob_ptr = ext_blob->data();
         void* intr_blob_ptr = intr_blob.getData();
+        fprintf(stderr, "[OV-DBG-PO] output[%zu] node='%s' outDims=[%zu,%zu,...] intr_ptr=%p ext_ptr=%p\n",
+                output_index, node->getName().c_str(),
+                outDims.size() > 0 ? outDims[0] : 0, outDims.size() > 1 ? outDims[1] : 0,
+                intr_blob_ptr, ext_blob_ptr);
+        // If the external tensor's ProxyMemoryBlock was initialized with zero-dim placeholder
+        // shapes, its recorded size is 0. OutputControlBlock::update() calls
+        // setMemBlockResize(currentMemBlock()) which resizes the underlying buffer back to 0,
+        // leaving data() == nullptr even after the graph has produced real output.
+        // Fix: force set_shape to resize the ProxyMemoryBlock to the actual output dims.
+        if (ext_blob_ptr == nullptr) {
+            if (intr_blob_ptr == nullptr) {
+                continue;  // Both null — truly empty (e.g. PA KV-cache stub). Skip.
+            }
+            ext_blob->set_shape(outDims);  // forces ProxyMemoryBlock->resize(actual bytes)
+            ext_blob_ptr = ext_blob->data();
+            fprintf(stderr, "[OV-DBG-PO] output[%zu] after set_shape ext_ptr=%p\n",
+                    output_index, ext_blob_ptr);
+            if (ext_blob_ptr == nullptr) {
+                fprintf(stderr, "[OV-DBG-PO] output[%zu] STILL null after set_shape — skipping\n", output_index);
+                continue;  // Still null after resize — shouldn't happen, but guard anyway.
+            }
+        }
         DEBUG_LOG(output_index,
                   " @ ",
                   intr_blob_ptr,

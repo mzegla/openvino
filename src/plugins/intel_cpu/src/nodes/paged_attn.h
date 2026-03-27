@@ -36,7 +36,20 @@ public:
 
     // pastkv may have zero dimension
     bool isExecutable() const override {
-        return !isInputTensorAtPortEmpty(0) && !isInputTensorAtPortEmpty(1) && !isInputTensorAtPortEmpty(2);
+        // Do NOT use isInputTensorAtPortEmpty() — it short-circuits on inputShapes[port].hasZeroDims()
+        // which is stale when the model was compiled with zero-dim placeholder input shapes.
+        // Instead, check the actual runtime edge memory descriptor directly.
+        for (size_t port = 0; port < 3; ++port) {
+            if (port >= getParentEdges().size()) return false;
+            const auto edge = getParentEdgeAt(port);
+            if (!edge) return false;
+            const auto& desc = edge->getMemory().getDesc();
+            // Undefined descriptor → shape not yet known → not executable.
+            if (!desc.isDefined()) return false;
+            // Zero-dim runtime shape (empty tensor) → not executable.
+            if (desc.getShape().hasZeroDims()) return false;
+        }
+        return true;
     }
 
     bool needPrepareParams() const override {

@@ -78,6 +78,14 @@ Reshape::Reshape(const std::shared_ptr<ov::Node>& op, const GraphContext::CPtr& 
 
 bool Reshape::needShapeInfer() const {
     const auto& mem = getParentEdgeAt(1)->getMemory();
+    // If the shape-spec input (port 1) has not yet been materialised to a
+    // static descriptor (e.g. it is a Concat whose upstream PA output is still
+    // dynamic), we cannot safely read getStaticDims(). Return true so that
+    // Node::shapeInfer() is invoked; it will return skip gracefully for
+    // undefined inputs and the node will be retried once upstream has run.
+    if (!mem.getDesc().getShape().isStatic()) {
+        return true;
+    }
     if (lastSecondInputValues.empty()) {
         lastSecondInputValues.resize(mem.getStaticDims()[0], 0);
     }
