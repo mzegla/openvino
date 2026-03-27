@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -797,6 +798,24 @@ void Node::updateDynamicParams() {
     try {
         if (isExecutable()) {
             if (needPrepareParams()) {
+                // If shapeInfer() returned skip (upstream InternalDyn not yet executed),
+                // the output shape is still undefined — defer prepareParams() to the
+                // late-redefine path in executeDynamic().
+                if (!outputShapesDefined()) {
+                    return;
+                }
+                // For InternalDyn nodes (e.g. PagedAttention), output shapes are only
+                // known AFTER executeDynamicImpl() calls redefineOutputMemory() internally.
+                // When outputs were stub-initialized to zero-dims (to break cascade), we
+                // must NOT call prepareParams() yet — doing so with zero-dim outputs causes
+                // DNNL primitive config with null/zero memory ptrs.
+                // The deferred path in executeDynamic() will call redefineOutputMemory +
+                // updateDynamicParams once PA has actually executed and set real shapes.
+                const bool isInternalDyn = shapeInference &&
+                                           shapeInference->get_port_mask() == FULL_PORT_MASK;
+                if (isInternalDyn && outputHasZeroDims()) {
+                    return;
+                }
                 OPENVINO_ASSERT(inputShapesDefined(), "Input shapes are not defined.");
                 DEBUG_LOG(" prepareParams() on #",
                           getExecIndex(),
@@ -833,8 +852,151 @@ void Node::executeStatic(const dnnl::stream& strm, int numaId) {
 
 void Node::executeDynamic(const dnnl::stream& strm, int numaId) {
     if (isExecutable()) {
+        const bool isInternalDyn = shapeInference &&
+                                   shapeInference->get_port_mask() == FULL_PORT_MASK;
+        if (isInternalDyn) {
+            // InternalDyn nodes (PA) call getStaticDims() on their inputs inside executeDynamicImpl.
+            // Only guard against truly undefined dims on computation inputs (ports 0-2: q/k/v).
+            // Auxiliary KV-cache management inputs (block_table, cache storage, etc.) may have
+            // dynamic descriptors and must NOT block execution.
+            const size_t numPorts = getParentEdges().size();
+            const size_t guardPorts = std::min(numPorts, static_cast<size_t>(3));  // q, k, v only
+            for (size_t i = 0; i < guardPorts; ++i) {
+                if (!getParentEdgeAt(i)->getMemory().getDesc().isDefined()) {
+                    fprintf(stderr, "[OV-DBG] InternalDyn '%s' port %zu not isDefined, skipping\n",
+                            getName().c_str(), i);
+                    return;  // DON'T call updateLastInputDims()
+                }
+            }
+        } else if (!outputShapesDefined() || outputHasZeroDims()) {
+            // Either:
+            // a) outputs are undefined (shapeInfer skipped during update phase because PA hadn't run)
+            // b) outputs are defined but zero-dim (graph compiled with zero-seq placeholder shapes;
+            //    actual runtime inputs are non-zero so we must re-infer now)
+            auto result = shapeInfer();
+            if (result.status == ShapeInferStatus::success) {
+                // Only update if the new shape is an improvement (non-zero or newly defined)
+                bool hasImprovement = false;
+                for (size_t i = 0; i < result.dims.size(); ++i) {
+                    const auto& newDims = result.dims[i];
+                    bool newHasZero = std::any_of(newDims.begin(), newDims.end(),
+                                                  [](size_t d){ return d == 0; });
+                    if (!newHasZero) { hasImprovement = true; break; }
+                }
+                if (hasImprovement || !outputShapesDefined()) {
+                    redefineOutputMemory(result.dims);
+                    updateDynamicParams();
+                }
+            } else {
+                // Still can't infer (upstream still dynamic) — skip execution.
+                fprintf(stderr, "[OV-DBG] executeDynamic '%s' shapeInfer returned skip, skipping\n",
+                        getName().c_str());
+                return;  // DON'T call updateLastInputDims()
+            }
+        }
+
         toNumaNode(numaId);
         executeDynamicImpl(strm);
+        // For InternalDyn (PA) nodes: verify output[0] is now defined.
+        // If PA's executeDynamicImpl doesn't call redefineOutputMemory, all downstream
+        // nodes will remain undefined and cascade-skip forever.
+        if (isInternalDyn && !getChildEdges().empty()) {
+            const auto& out0desc = getChildEdgeAt(0)->getMemory().getDesc();
+            if (!out0desc.isDefined()) {
+                fprintf(stderr, "[OV-DBG] InternalDyn '%s' executed but output[0] STILL !isDefined\n",
+                        getName().c_str());
+            } else {
+                const auto& dims = out0desc.getShape().getDims();
+                fprintf(stderr, "[OV-DBG] InternalDyn '%s' executed OK, out[0] dims=[",
+                        getName().c_str());
+                for (size_t i = 0; i < dims.size(); ++i) {
+                    fprintf(stderr, "%zu%s", dims[i], i+1 < dims.size() ? "," : "");
+                }
+                fprintf(stderr, "]\n");
+            }
+        }
+    } else if (!outputShapesDefined() || outputHasZeroDims()) {
+        // Non-executable nodes (e.g. in-place Reshape) that are downstream of an InternalDyn node
+        // (PA) also need a late shape inference pass — their shapes weren't defined during the
+        // prepass because PA hadn't executed yet.
+        // NOTE: InternalDyn (PA) nodes that are non-executable here mean neverExecute()==true
+        // (zero-token context) — we must NOT call executeDynamicImpl() on them.
+        const bool isNonExecInternalDyn = shapeInference &&
+                                          shapeInference->get_port_mask() == FULL_PORT_MASK;
+        if (isNonExecInternalDyn) {
+            // Non-exec InternalDyn (PA with zero-dim Q/K/V from graph initialization).
+            // Diagnostic: print WHY PA is non-executable (only once per node per run).
+            if (!m_dbgNonExecPrinted) {
+                m_dbgNonExecPrinted = true;
+                fprintf(stderr, "[PA-NOEXEC] '%s': non-exec. Q/K/V port states:\n", getName().c_str());
+                for (size_t dbgP = 0; dbgP < std::min(getParentEdges().size(), (size_t)3); ++dbgP) {
+                    const auto dbgEdge = getParentEdgeAt(dbgP);
+                    if (!dbgEdge) { fprintf(stderr, "  port%zu: null edge\n", dbgP); continue; }
+                    const auto& dbgDesc = dbgEdge->getMemory().getDesc();
+                    const auto& dbgDims = dbgDesc.isDefined() ? dbgDesc.getShape().getDims() : VectorDims{};
+                    fprintf(stderr, "  port%zu: isDefined=%d hasZeroDims=%d dimRank=%zu\n",
+                            dbgP, (int)dbgDesc.isDefined(),
+                            (int)(dbgDesc.isDefined() && dbgDesc.getShape().hasZeroDims()),
+                            dbgDims.size());
+                }
+            }
+            // Non-exec InternalDyn (PA with zero-dim Q/K/V from graph initialization).
+            // InternalDynShapeInfer::infer() always returns skip, so we cannot derive output
+            // shapes via shapeInfer().  However, if any output edge is UNDEFINED (as opposed to
+            // defined-but-zero-dim), downstream nodes will permanently fail their isDefined guard
+            // in shapeInfer and cascade-skip forever.
+            //
+            // Mitigation: initialize every undefined output edge to a zero-dim shape derived from
+            // the corresponding input port.  This makes outputs "defined-but-zero-dim" so
+            // downstream shapeInfer calls can proceed.  When real (non-zero) inputs arrive on the
+            // next inference call, isExecutable() will return true, outputHasZeroDims() will
+            // trigger a fresh shapeInfer + redefineOutputMemory + execute cycle, and the correct
+            // shapes will be propagated.
+            bool hasUndefined = false;
+            for (size_t i = 0; i < outputShapes.size(); ++i) {
+                if (!getChildEdgeAt(i)->getMemory().getDesc().isDefined()) {
+                    hasUndefined = true;
+                    break;
+                }
+            }
+            if (hasUndefined) {
+                std::vector<VectorDims> initDims;
+                initDims.reserve(outputShapes.size());
+                for (size_t i = 0; i < outputShapes.size(); ++i) {
+                    const auto& outDesc = getChildEdgeAt(i)->getMemory().getDesc();
+                    if (!outDesc.isDefined()) {
+                        // Build a zero-dim vector matching the output descriptor's rank.
+                        // This keeps the rank consistent so cloneWithNewDims doesn't fail,
+                        // while marking the output as "defined-but-empty" so downstream
+                        // shapeInfer can proceed past the isDefined() guard.
+                        const size_t rank = outDesc.getShape().getRank();
+                        initDims.push_back(VectorDims(rank, 0));
+                    } else {
+                        initDims.push_back(outDesc.getShape().getDims());
+                    }
+                }
+                redefineOutputMemory(initDims);
+            }
+        } else {
+            // Non-exec node (in-place Reshape etc.) with undefined or zero-dim output.
+            // Retry shapeInfer with the current (possibly updated by upstream PA) input dims.
+            auto result = shapeInfer();
+            if (result.status == ShapeInferStatus::success) {
+                bool hasImprovement = false;
+                for (size_t i = 0; i < result.dims.size(); ++i) {
+                    const auto& newDims = result.dims[i];
+                    bool newHasZero = std::any_of(newDims.begin(), newDims.end(),
+                                                  [](size_t d){ return d == 0; });
+                    if (!newHasZero) { hasImprovement = true; break; }
+                }
+                if (hasImprovement || !outputShapesDefined()) {
+                    redefineOutputMemory(result.dims);
+                }
+            } else {
+                fprintf(stderr, "[OV-DBG] executeDynamic '%s' non-exec shapeInfer skip\n",
+                        getName().c_str());
+            }
+        }
     }
 
     updateLastInputDims();
@@ -1799,7 +1961,12 @@ bool Node::hasEmptyOutputTensors() const {
 
 bool Node::inputShapesDefined() const {
     for (size_t i = 0; i < getParentEdges().size(); i++) {
-        if (!getParentEdgeAt(i)->getMemory().getDesc().isDefined()) {
+        const auto& desc = getParentEdgeAt(i)->getMemory().getDesc();
+        // Both conditions are required: isDefined() checks the memory layout has no
+        // UNDEFINED values, and isStatic() checks the Shape type is ShapeType::Static.
+        // getStaticDims() (called downstream by shapeInfer/inputShapesModified) requires
+        // ShapeType::Static, so a Dynamic-typed shape with known dims still fails.
+        if (!desc.isDefined() || !desc.getShape().isStatic()) {
             return false;
         }
     }
@@ -1808,11 +1975,25 @@ bool Node::inputShapesDefined() const {
 
 bool Node::outputShapesDefined() const {
     for (size_t i = 0; i < outputShapes.size(); i++) {
-        if (!getChildEdgeAt(i)->getMemory().getDesc().isDefined()) {
+        const auto& desc = getChildEdgeAt(i)->getMemory().getDesc();
+        if (!desc.isDefined() || !desc.getShape().isStatic()) {
             return false;
         }
     }
     return true;
+}
+
+// Returns true if any output is defined but has zero dims — these are
+// initialization placeholders from graph compilation with zero-seq shapes
+// and must be re-inferred when actual non-zero runtime inputs arrive.
+bool Node::outputHasZeroDims() const {
+    for (size_t i = 0; i < outputShapes.size(); i++) {
+        const auto& desc = getChildEdgeAt(i)->getMemory().getDesc();
+        if (desc.isDefined() && desc.getShape().hasZeroDims()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool Node::shapesDefined() const {
@@ -1832,7 +2013,14 @@ bool Node::inputShapesModified() const {
     }
 
     for (size_t i = 0; i < lastInputDims.size(); i++) {
-        if (lastInputDims[i] != getParentEdgeAt(i)->getMemory().getStaticDims()) {
+        const auto& desc = getParentEdgeAt(i)->getMemory().getDesc();
+        if (!desc.isDefined()) {
+            // Upstream output has undefined dims (e.g. awaiting InternalDyn execution).
+            // Treat as modified so shapeInfer() will be attempted (it returns skip
+            // gracefully for undefined inputs).
+            return true;
+        }
+        if (lastInputDims[i] != desc.getShape().getDims()) {
             return true;
         }
     }
@@ -1877,7 +2065,18 @@ IShapeInfer::Result Node::shapeInfer() const {
 
     input_shapes.reserve(inputShapes.size());
     for (size_t port = 0; port < inputShapes.size(); ++port) {
-        input_shapes.emplace_back(std::ref(getParentEdgeAt(port)->getMemory().getStaticDims()));
+        const auto& desc = getParentEdgeAt(port)->getMemory().getDesc();
+        if (!desc.isDefined()) {
+            // Upstream node (e.g. PagedAttentionExtension with InternalDynShapeInferFactory)
+            // hasn't executed yet — its output shape has undefined dimensions.
+            // Return skip so callers can retry once the upstream has run.
+            // Log with parent node name to trace cascade origin.
+            const auto* parentNode = getParentEdgeAt(port)->getParent().get();
+            fprintf(stderr, "[OV-DBG-SKIP] node='%s' port=%zu undefined, parent='%s'\n",
+                    getName().c_str(), port, parentNode ? parentNode->getName().c_str() : "null");
+            return {{}, ShapeInferStatus::skip};
+        }
+        input_shapes.emplace_back(std::ref(desc.getShape().getDims()));
     }
 
     std::unordered_map<size_t, MemoryPtr> input_values;

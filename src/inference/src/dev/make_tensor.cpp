@@ -4,6 +4,8 @@
 
 #include "openvino/runtime/make_tensor.hpp"
 
+#include <cstdio>
+#include <execinfo.h>
 #include <memory>
 #include <mutex>
 
@@ -54,6 +56,20 @@ public:
           m_strides{},
           m_strides_once{},
           m_ptr{ptr} {
+        if (!(shape_size(shape) == 0 || m_ptr != nullptr)) {
+            fprintf(stderr, "[OV-DBG] ViewTensor NULL ptr: shape=[");
+            for (size_t _i = 0; _i < shape.size(); ++_i)
+                fprintf(stderr, "%zu%s", shape[_i], _i + 1 < shape.size() ? "," : "");
+            fprintf(stderr, "] type=%s\n", element_type.get_type_name().c_str());
+            // Print call stack so we can find the exact caller
+            void* bt_buf[32];
+            int bt_size = backtrace(bt_buf, 32);
+            char** bt_syms = backtrace_symbols(bt_buf, bt_size);
+            fprintf(stderr, "[OV-DBG] ViewTensor NULL ptr call stack (%d frames):\n", bt_size);
+            for (int _bi = 0; _bi < bt_size; ++_bi)
+                fprintf(stderr, "  [%d] %s\n", _bi, bt_syms ? bt_syms[_bi] : "?");
+            if (bt_syms) free(bt_syms);
+        }
         OPENVINO_ASSERT(shape_size(shape) == 0 || m_ptr != nullptr);
         OPENVINO_ASSERT(m_element_type.is_static());
     }

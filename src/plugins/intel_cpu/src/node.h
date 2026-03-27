@@ -803,6 +803,7 @@ protected:
 
     bool inputShapesDefined() const;
     bool outputShapesDefined() const;
+    bool outputHasZeroDims() const;
     bool shapesDefined() const;
     void updateLastInputDims();
 
@@ -834,6 +835,8 @@ protected:
     }
 
     std::vector<VectorDims> lastInputDims;
+
+    mutable bool m_dbgNonExecPrinted = false;  // per-node once-flag for PA non-exec diagnostic
 
     std::shared_ptr<IShapeInfer> shapeInference;
 
