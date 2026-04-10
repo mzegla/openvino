@@ -526,6 +526,7 @@ struct MHAHelper {
     PlainTensor _flash_v_scratch;      // [nthr, block_size * rnd_up(SV, block_size)] – V packing buffer
     std::vector<std::shared_ptr<BrgemmKernel>> _qk_gemm_flash;      // LDC = block_size (vs _new_score_stride)
     std::vector<std::shared_ptr<BrgemmKernel>> _wv_gemm_acc_flash;  // accumulate, LDA = (1|2)*block_size
+    PlainTensor _flash_dequant_tmp;    // [nthr, max(block_size*S, block_size*rnd_up(SV,block_size))] – K/V dequant intermediate (quantised KV only)
 
     MHAHelper() {
         _weight.resize<float>({size_t{1}, size_t{1}, size_t{1}, size_t{1}});
@@ -704,7 +705,7 @@ struct MHAHelper {
             _block_rotation_coefficient_scratch.resize<DATA_TYPE>({_block_size, S});
         }
 
-        // Initialise flash attention buffers and GEMM kernels (x86 AVX-512 only, non-sage, non-quantised).
+        // Initialise flash attention buffers and GEMM kernels (x86 AVX-512 only, non-sage).
         _use_flash_attn = g_flash_attn;
 #    if defined(HAVE_AVX512F)
         if (_use_flash_attn && !AarchF16) {
@@ -713,6 +714,15 @@ struct MHAHelper {
             _flash_score.resize<float>({_nthr, _block_size, _block_size});
             _flash_k_scratch.resize<DATA_TYPE>({_nthr, _block_size * S});
             _flash_v_scratch.resize<DATA_TYPE>({_nthr, _block_size * rnd_up(SV, _block_size)});
+            // Per-thread dequant intermediate for quantised K/V: large enough for one full K or V block.
+            constexpr bool kv_needs_dequant =
+                any_of(KEY_PREC, ov::element::u8, ov::element::u4) ||
+                any_of(VALUE_PREC, ov::element::u8, ov::element::u4);
+            if constexpr (kv_needs_dequant) {
+                const size_t dequant_elems =
+                    std::max(_block_size * S, _block_size * rnd_up(SV, _block_size));
+                _flash_dequant_tmp.resize<DATA_TYPE>({_nthr, dequant_elems});
+            }
             if (_qk_gemm_flash.empty()) {
                 _qk_gemm_flash.resize(_block_size);
                 _wv_gemm_acc_flash.resize(_block_size);
@@ -1278,10 +1288,16 @@ struct MHAHelper {
                 // --------------------------------------------------------------
                 auto* k_raw = present_key.ptr<typename ov::element_type_traits<KEY_PREC>::value_type,
                                              KEY_PREC>(block_number, hk);
+                // For quantised KEY_PREC (u8/u4): transpose_16NxK dequantises into tmp first.
+                constexpr bool k_is_quantised = any_of(KEY_PREC, ov::element::u8, ov::element::u4);
+                DATA_TYPE* k_dequant_tmp = nullptr;
+                if constexpr (k_is_quantised) {
+                    k_dequant_tmp = _flash_dequant_tmp.ptr<DATA_TYPE>(ithr);
+                }
                 transpose_16NxK<DATA_TYPE, KEY_PREC>(
                     _flash_k_scratch.ptr<DATA_TYPE>(ithr),
                     k_raw,
-                    nullptr,  // tmp unused for non-quantised types
+                    k_dequant_tmp,
                     valid_kv,
                     S,
                     _block_size,
@@ -1378,15 +1394,25 @@ struct MHAHelper {
                 }
 
                 // --------------------------------------------------------------
-                // V packing (xf16) or direct pointer (f32).
+                // V packing: xf16 uses pack_32NxK; f32 uses V directly or dequantises.
+                // For quantised VALUE_PREC (u8/u4), dequant tmp is passed to pack_32NxK (xf16)
+                // or dequant is called explicitly (f32).
                 // --------------------------------------------------------------
+                constexpr bool v_is_quantised = any_of(VALUE_PREC, ov::element::u8, ov::element::u4);
+                void* v_raw = present_value.ptr<typename ov::element_type_traits<VALUE_PREC>::value_type,
+                                               VALUE_PREC>(block_number, hk);
                 DATA_TYPE* v_ptr = nullptr;
                 if constexpr (q_is_xf16) {
+                    // pack_32NxK handles both quantised and non-quantised VALUE_PREC;
+                    // it needs a tmp buffer when dequantising.
+                    DATA_TYPE* v_dequant_tmp = nullptr;
+                    if constexpr (v_is_quantised) {
+                        v_dequant_tmp = _flash_dequant_tmp.ptr<DATA_TYPE>(ithr);
+                    }
                     pack_32NxK<DATA_TYPE, VALUE_PREC>(
                         _flash_v_scratch.ptr<DATA_TYPE>(ithr),
-                        present_value.ptr<typename ov::element_type_traits<VALUE_PREC>::value_type,
-                                         VALUE_PREC>(block_number, hk),
-                        nullptr,  // tmp unused for non-quantised VALUE_PREC
+                        v_raw,
+                        v_dequant_tmp,
                         valid_kv,
                         SV,
                         _block_size,
@@ -1395,8 +1421,20 @@ struct MHAHelper {
                         _params.value_group_size,
                         _params.quant_value_bychannel);
                     v_ptr = _flash_v_scratch.ptr<DATA_TYPE>(ithr);
+                } else if constexpr (v_is_quantised) {
+                    // f32 DATA_TYPE with quantised V: dequantise into the shared dequant tmp buffer.
+                    // dequant zero-pads rows N..block_size, matching the non-quantised behaviour.
+                    dequant<DATA_TYPE, VALUE_PREC>(
+                        _flash_dequant_tmp.ptr<DATA_TYPE>(ithr),
+                        v_raw,
+                        valid_kv,
+                        SV,
+                        _block_size,
+                        _params.value_group_size,
+                        _params.quant_value_bychannel);
+                    v_ptr = _flash_dequant_tmp.ptr<DATA_TYPE>(ithr);
                 } else {
-                    // F32: use V directly; invalid rows multiplied by zero score, contribute nothing.
+                    // f32 DATA_TYPE, non-quantised V: use directly (row-major [block_size, SV]).
                     v_ptr = present_value.ptr<DATA_TYPE>(block_number, hk);
                 }
 
@@ -1902,14 +1940,13 @@ struct MHA {
         _helper.init_reorder_buffers(_workitems.get_reorder_max_batch_size(),
                                      div_up(_workitems.get_reorder_max_kv_len(), _helper._block_size));
 
-        // Flash attention path: non-quantised, non-sage, x86 AVX-512 only, no image-token VLM attention.
+        // Flash attention path: non-sage, x86 AVX-512 only, no image-token VLM attention.
+        // Supports both non-quantised (f32/bf16/f16) and quantised (u8/u4) K/V caches.
+        // i8 KEY_PREC is SageAttn and is already excluded by !is_sage_attn.
         // When active the reorder phase is skipped; K/V are packed on-the-fly per thread.
 #    if defined(HAVE_AVX512F)
-        constexpr bool keyval_is_quantised =
-            any_of(KEY_PREC, ov::element::u8, ov::element::u4, ov::element::i8) ||
-            any_of(VALUE_PREC, ov::element::u8, ov::element::u4);
         const bool use_flash = _helper._use_flash_attn && !_helper._params.is_sage_attn &&
-                               !keyval_is_quantised && !_helper._has_image_tokens &&
+                               !_helper._has_image_tokens &&
                                !_helper._qk_gemm_flash.empty() &&
                                (_helper._sparse_mask_block_size == 0 ||
                                 _helper._sparse_mask_block_size == _helper._block_size);
