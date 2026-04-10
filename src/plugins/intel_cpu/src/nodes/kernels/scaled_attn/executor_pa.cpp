@@ -56,6 +56,12 @@ using namespace ov::intel_cpu;
 // currently depends on brgemm which only support x64 or ARM SVE
 #if defined(OPENVINO_ARCH_X86_64) || (defined(OPENVINO_ARCH_ARM64) && defined(HAVE_SVE))
 
+// Flash attention prefill path toggle. Read once at startup; set OV_CPU_PA_FLASH_ATTN=1 to enable.
+static const bool g_flash_attn = []() {
+    const char* e = std::getenv("OV_CPU_PA_FLASH_ATTN");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+}();
+
 #    if defined(HAVE_AVX2) || defined(HAVE_AVX512F)
 
 #        define prefetch_bytes(bytes, sel, advance, src) \
@@ -510,6 +516,17 @@ struct MHAHelper {
     }
     CpuParallelPtr _cpu_parallel;
 
+    // Flash attention per-thread state — constant size regardless of kv_len.
+    // Only allocated when g_flash_attn == true.
+    bool _use_flash_attn = false;
+    PlainTensor _flash_m;              // [nthr, block_size] – running row max
+    PlainTensor _flash_l;              // [nthr, block_size] – softmax denominator
+    PlainTensor _flash_score;          // [nthr, block_size, block_size] – score tile (float, L1-resident)
+    PlainTensor _flash_k_scratch;      // [nthr, block_size * S] – per-thread K packing buffer
+    PlainTensor _flash_v_scratch;      // [nthr, block_size * rnd_up(SV, block_size)] – V packing buffer
+    std::vector<std::shared_ptr<BrgemmKernel>> _qk_gemm_flash;      // LDC = block_size (vs _new_score_stride)
+    std::vector<std::shared_ptr<BrgemmKernel>> _wv_gemm_acc_flash;  // accumulate, LDA = (1|2)*block_size
+
     MHAHelper() {
         _weight.resize<float>({size_t{1}, size_t{1}, size_t{1}, size_t{1}});
     }
@@ -686,6 +703,45 @@ struct MHAHelper {
         if (init_rotation_coefficient_scratch) {
             _block_rotation_coefficient_scratch.resize<DATA_TYPE>({_block_size, S});
         }
+
+        // Initialise flash attention buffers and GEMM kernels (x86 AVX-512 only, non-sage, non-quantised).
+        _use_flash_attn = g_flash_attn;
+#    if defined(HAVE_AVX512F)
+        if (_use_flash_attn && !AarchF16) {
+            _flash_m.resize<float>({_nthr, _block_size});
+            _flash_l.resize<float>({_nthr, _block_size});
+            _flash_score.resize<float>({_nthr, _block_size, _block_size});
+            _flash_k_scratch.resize<DATA_TYPE>({_nthr, _block_size * S});
+            _flash_v_scratch.resize<DATA_TYPE>({_nthr, _block_size * rnd_up(SV, _block_size)});
+            if (_qk_gemm_flash.empty()) {
+                _qk_gemm_flash.resize(_block_size);
+                _wv_gemm_acc_flash.resize(_block_size);
+                const size_t wv_stride = q_is_xf16 ? _output.stride(1) : H * SV;
+                for (size_t i = 0; i < _block_size; i++) {
+                    // QK gemm: same shape as _qk_gemm[i] but LDC = block_size (score tile) not _new_score_stride.
+                    _qk_gemm_flash[i] = std::make_shared<BrgemmKernel>(i + 1,
+                                                                        _block_size,
+                                                                        S,
+                                                                        H * S,        // LDA: query row stride
+                                                                        _block_size,  // LDB: packed K stride
+                                                                        _block_size,  // LDC: tile width
+                                                                        false,
+                                                                        in_type);
+                    // WV gemm accumulate: LDA = (1|2)*block_size instead of _new_score_stride.
+                    _wv_gemm_acc_flash[i] = std::make_shared<BrgemmKernel>(
+                        i + 1,
+                        SV,
+                        _block_size,
+                        (in_type == ov::element::Type_t::f32 ? 1 : 2) * _block_size,  // LDA: score tile row stride
+                        SV,         // LDB: V stride
+                        wv_stride,  // LDC: output stride
+                        false,
+                        in_type,
+                        /*accumulate=*/true);
+                }
+            }
+        }
+#    endif
     }
 
     void init_reorder_buffers(size_t batch, size_t kv_len_in_blocks) {
@@ -1139,6 +1195,258 @@ struct MHAHelper {
         }
     }
 #    endif
+
+    // Flash-attention prefill kernel: KV-outer loop with online softmax (Milakov & Gimelshein).
+    // Eliminates the kv_len-sized _weight buffer and the separate reorder (pack-KV) phase.
+    // K and V blocks are packed on-the-fly into per-thread scratch (_flash_k/v_scratch).
+    //
+    // Phase 1 restrictions (enforced by the use_flash guard in exec_loop_mixed):
+    //   - x86 AVX-512 only
+    //   - non-sage, non-quantised K/V
+    //   - no image-token bidirectional attention (_has_image_tokens must be false)
+    //   - score_output not yet supported (falls through to exec_kernel_multiple when needed)
+    //
+    //  query       : [H, q_len, S]           (already permuted by exec_loop_mixed)
+    //  present_key : [block_number, Hk, block_size, S]
+    //  present_value: [block_number, Hk, block_size, SV]
+    //  output_emb  : [q_len, H * SV]
+#    if defined(HAVE_AVX512F)
+    void exec_kernel_flash_prefill(const PlainTensor& query,
+                                   const PlainTensor& present_key,
+                                   const PlainTensor& present_value,
+                                   const PlainTensor& output_emb,
+                                   const int32_t* block_table,
+                                   size_t ithr,
+                                   size_t q_blk,
+                                   size_t hq_beg,
+                                   size_t hq_end,
+                                   size_t hk,
+                                   size_t q_len,
+                                   size_t cur_kv_len,
+                                   const PlainTensor& alibi_slopes,
+                                   size_t batch_in_seq,
+                                   const std::vector<PlainTensor>& sparse_attention_mask) {
+        constexpr bool q_is_xf16 = any_of(precision_of<DATA_TYPE>::value, ov::element::bf16, ov::element::f16);
+
+        const auto q_start = q_blk * _block_size;
+        const auto q_end = std::min(q_start + _block_size, q_len);
+        const auto q_cnt = q_end - q_start;
+        const auto cur_kv_len_blocks = div_up(cur_kv_len, _block_size);
+
+        float* m_run = _flash_m.ptr<float>(ithr);
+        float* l_run = _flash_l.ptr<float>(ithr);
+        float* score_tile = _flash_score.ptr<float>(ithr);  // [block_size, block_size] float
+
+        for (size_t h = hq_beg; h < hq_end; h++) {
+            // ------------------------------------------------------------------
+            // Initialise per-head running state
+            // ------------------------------------------------------------------
+            for (size_t qi = 0; qi < q_cnt; qi++) {
+                m_run[qi] = -FLT_MAX;
+                l_run[qi] = 0.f;
+                memset(_output.ptr<float>(ithr, qi, h, 0), 0, SV * sizeof(float));
+            }
+            float* fp32_out_ptr = _output.ptr<float>(ithr, 0, h, 0);
+            auto* q_ptr = query.ptr<DATA_TYPE>(h, q_start, 0);
+
+            for (size_t kv_blk = 0; kv_blk < cur_kv_len_blocks; kv_blk++) {
+                const auto block_number = block_table[kv_blk];
+                if (block_number < 0) {
+                    continue;
+                }
+                const auto valid_kv = std::min(_block_size, cur_kv_len - kv_blk * _block_size);
+
+                // Sparse attention mask: skip tile if entirely masked
+                if (!sparse_attention_mask.empty() &&
+                    sparse_attention_mask[batch_in_seq].ptr_v() != nullptr) {
+                    if (!sparse_attention_mask[batch_in_seq].ptr<bool>(h, q_blk, kv_blk)[0]) {
+                        continue;
+                    }
+                }
+
+                // Sliding window: skip blocks entirely before the window
+                if (_sliding_window > 0 && cur_kv_len > _sliding_window) {
+                    const auto kv_blk_end = (kv_blk + 1) * _block_size;
+                    if (kv_blk_end <= cur_kv_len - _sliding_window) {
+                        continue;
+                    }
+                }
+
+                // --------------------------------------------------------------
+                // Pack K block into thread-local scratch (replicates the reorder
+                // phase but scoped to a single block for this thread).
+                // --------------------------------------------------------------
+                auto* k_raw = present_key.ptr<typename ov::element_type_traits<KEY_PREC>::value_type,
+                                             KEY_PREC>(block_number, hk);
+                transpose_16NxK<DATA_TYPE, KEY_PREC>(
+                    _flash_k_scratch.ptr<DATA_TYPE>(ithr),
+                    k_raw,
+                    nullptr,  // tmp unused for non-quantised types
+                    valid_kv,
+                    S,
+                    _block_size,
+                    _block_size,  // dst_stride
+                    S,            // src_stride
+                    _params.key_group_size,
+                    _params.quant_key_bychannel);
+
+                // --------------------------------------------------------------
+                // QK GEMM: Q[q_cnt,S] x K[block_size,S]^T -> score_tile[q_cnt,block_size] (float)
+                // --------------------------------------------------------------
+                _qk_gemm_flash[q_cnt - 1]->executeGemm(
+                    q_cnt < _block_size,
+                    q_ptr,
+                    _flash_k_scratch.ptr<DATA_TYPE>(ithr),
+                    score_tile,
+                    nullptr,
+                    nullptr,
+                    _wsp.data() + ithr * _wsp_size_per_thread,
+                    _qk_scratch_a ? _qk_scratch_a.ptr<DATA_TYPE>(ithr, 0) : nullptr);
+
+                // --------------------------------------------------------------
+                // Online softmax update per Q-row: update running (m, l, O_acc).
+                // --------------------------------------------------------------
+                for (size_t qi = 0; qi < q_cnt; qi++) {
+                    float* row = score_tile + qi * _block_size;
+
+                    // Causal exclusive upper-bound within this KV block
+                    const int causal_end = static_cast<int>(cur_kv_len - q_cnt + qi + 1) -
+                                           static_cast<int>(kv_blk * _block_size);
+
+                    // Sliding window lower-bound within this KV block
+                    int win_start = 0;
+                    if (_sliding_window > 0 && cur_kv_len > _sliding_window) {
+                        win_start = static_cast<int>(cur_kv_len - _sliding_window) -
+                                    static_cast<int>(kv_blk * _block_size);
+                        if (win_start < 0) {
+                            win_start = 0;
+                        }
+                    }
+
+                    float alibi_slope = 0.f;
+                    if (alibi_slopes) {
+                        alibi_slope = alibi_slopes.ptr<float>()[h];
+                    }
+
+                    // Scale, apply alibi, mask invalid positions, find block max.
+                    float m_new = m_run[qi];
+                    for (int k = 0; k < static_cast<int>(_block_size); k++) {
+                        if (k >= win_start && k < causal_end && k < static_cast<int>(valid_kv)) {
+                            float val = row[k] * _d_scale;
+                            if (alibi_slope != 0.f) {
+                                const int abs_kv_pos = static_cast<int>(kv_blk * _block_size) + k;
+                                const int abs_q_pos = static_cast<int>(cur_kv_len) -
+                                                      static_cast<int>(q_cnt) +
+                                                      static_cast<int>(qi);
+                                val += alibi_slope * static_cast<float>(abs_kv_pos - abs_q_pos);
+                            }
+                            row[k] = val;
+                            m_new = std::max(m_new, val);
+                        } else {
+                            row[k] = -FLT_MAX;
+                        }
+                    }
+
+                    // Rescale existing O accumulator for max shift.
+                    const float rescale = (m_run[qi] == -FLT_MAX) ? 0.f : std::exp(m_run[qi] - m_new);
+                    if (rescale > 0.f && rescale != 1.f) {
+                        float* o_row = _output.ptr<float>(ithr, qi, h, 0);
+                        for (size_t sv = 0; sv < SV; sv++) {
+                            o_row[sv] *= rescale;
+                        }
+                    }
+                    const float l_upd = (m_run[qi] == -FLT_MAX) ? 0.f : l_run[qi] * rescale;
+
+                    // Compute softmax numerators in-place; zero masked positions.
+                    float block_sum = 0.f;
+                    for (size_t k = 0; k < _block_size; k++) {
+                        const float p = (row[k] > -FLT_MAX * 0.5f) ? std::exp(row[k] - m_new) : 0.f;
+                        row[k] = p;
+                        block_sum += p;
+                    }
+
+                    m_run[qi] = m_new;
+                    l_run[qi] = l_upd + block_sum;
+                }  // per Q-row online softmax
+
+                // Convert score tile float -> DATA_TYPE in-place so the WV GEMM reads DATA_TYPE.
+                if constexpr (q_is_xf16) {
+                    for (size_t qi = 0; qi < q_cnt; qi++) {
+                        float* row = score_tile + qi * _block_size;
+                        cvt_copy(reinterpret_cast<DATA_TYPE*>(row), row, 1, _block_size, _block_size, _block_size);
+                    }
+                }
+
+                // --------------------------------------------------------------
+                // V packing (xf16) or direct pointer (f32).
+                // --------------------------------------------------------------
+                DATA_TYPE* v_ptr = nullptr;
+                if constexpr (q_is_xf16) {
+                    pack_32NxK<DATA_TYPE, VALUE_PREC>(
+                        _flash_v_scratch.ptr<DATA_TYPE>(ithr),
+                        present_value.ptr<typename ov::element_type_traits<VALUE_PREC>::value_type,
+                                         VALUE_PREC>(block_number, hk),
+                        nullptr,  // tmp unused for non-quantised VALUE_PREC
+                        valid_kv,
+                        SV,
+                        _block_size,
+                        rnd_up(SV, _block_size),  // dst_stride
+                        SV,                       // src_stride
+                        _params.value_group_size,
+                        _params.quant_value_bychannel);
+                    v_ptr = _flash_v_scratch.ptr<DATA_TYPE>(ithr);
+                } else {
+                    // F32: use V directly; invalid rows multiplied by zero score, contribute nothing.
+                    v_ptr = present_value.ptr<DATA_TYPE>(block_number, hk);
+                }
+
+                // --------------------------------------------------------------
+                // WV accumulate: score_tile[q_cnt,block_size] x V[block_size,SV] -> fp32_out_ptr
+                // Always accumulate (O_acc initialised to zero above per head).
+                // --------------------------------------------------------------
+                _wv_gemm_acc_flash[q_cnt - 1]->executeGemm(
+                    q_cnt < _block_size,
+                    reinterpret_cast<DATA_TYPE*>(score_tile),  // A: score tile as DATA_TYPE
+                    v_ptr,                                     // B: V block
+                    fp32_out_ptr,                              // C: fp32 accumulator
+                    nullptr,
+                    nullptr,
+                    _wsp.data() + ithr * _wsp_size_per_thread,
+                    nullptr);
+            }  // kv_blk loop
+
+            // ------------------------------------------------------------------
+            // Normalise O accumulator by l_run, then write to output_emb.
+            // ------------------------------------------------------------------
+            for (size_t qi = 0; qi < q_cnt; qi++) {
+                if (l_run[qi] > 0.f) {
+                    const float inv_l = 1.f / l_run[qi];
+                    float* o_row = _output.ptr<float>(ithr, qi, h, 0);
+                    for (size_t sv = 0; sv < SV; sv++) {
+                        o_row[sv] *= inv_l;
+                    }
+                }
+            }
+
+            if constexpr (q_is_xf16) {
+                attn_memcpy2d_kernel(_output.ptr<float>(ithr, 0, h, 0),
+                                     output_emb.ptr<DATA_TYPE>(q_start, h * SV),
+                                     ov::element::f32,
+                                     precision_of<DATA_TYPE>::value,
+                                     _output.stride(1),
+                                     output_emb.stride(0),
+                                     SV,
+                                     q_cnt);
+            } else {
+                for (size_t qi = 0; qi < q_cnt; qi++) {
+                    memcpy(output_emb.ptr<DATA_TYPE>(q_start + qi, h * SV),
+                           _output.ptr<float>(ithr, qi, h, 0),
+                           SV * sizeof(float));
+                }
+            }
+        }  // head loop
+    }
+#    endif  // HAVE_AVX512F (flash prefill)
 
     // compute one token, loop along batch and head dimensions
     // all tensors such as query... have no batch dimension because batch dimension is varying
@@ -1594,7 +1902,23 @@ struct MHA {
         _helper.init_reorder_buffers(_workitems.get_reorder_max_batch_size(),
                                      div_up(_workitems.get_reorder_max_kv_len(), _helper._block_size));
 
-        // packed k, v
+        // Flash attention path: non-quantised, non-sage, x86 AVX-512 only, no image-token VLM attention.
+        // When active the reorder phase is skipped; K/V are packed on-the-fly per thread.
+#    if defined(HAVE_AVX512F)
+        constexpr bool keyval_is_quantised =
+            any_of(KEY_PREC, ov::element::u8, ov::element::u4, ov::element::i8) ||
+            any_of(VALUE_PREC, ov::element::u8, ov::element::u4);
+        const bool use_flash = _helper._use_flash_attn && !_helper._params.is_sage_attn &&
+                               !keyval_is_quantised && !_helper._has_image_tokens &&
+                               !_helper._qk_gemm_flash.empty() &&
+                               (_helper._sparse_mask_block_size == 0 ||
+                                _helper._sparse_mask_block_size == _helper._block_size);
+#    else
+        const bool use_flash = false;
+#    endif
+
+        // packed k, v  (skipped when flash attention is active)
+        if (!use_flash) {
         parallel_for2d_dynamic(reorder_work_count, Hk, [&](size_t w, size_t hk) {
             constexpr bool q_cache_is_same = precision_of<DATA_TYPE>::value == VALUE_PREC;
             const auto& item = _workitems.get_reorder_work_item(w);
@@ -1688,6 +2012,7 @@ struct MHA {
                 }
             }
         });
+        }  // if (!use_flash)
 
         // loop along HK dimension: if mixed first/second token and elements count is enough, loop HK to reuse KV in the
         // CPU cache
@@ -1778,6 +2103,27 @@ struct MHA {
                 sub_query.resize({q_len, _helper.H, _helper.S}, q.ptr<DATA_TYPE>(batch_in_token));
                 // physical layout (B_in_tokens, H, S)
                 sub_query = sub_query.permute({1, 0, 2});
+#    if defined(HAVE_AVX512F)
+                if (use_flash && score_output == nullptr) {
+                    _helper.exec_kernel_flash_prefill(
+                        sub_query,
+                        k_cache,
+                        v_cache,
+                        output_emb.slice(0, batch_in_token, batch_in_token + q_len)
+                            .reshape({q_len, _helper.H * _helper.SV}),
+                        block_indices.ptr<int32_t>() + block_indices_begins.ptr<int32_t>()[batch_in_seq],
+                        ithr,
+                        q_blk,
+                        hq_beg,
+                        hq_end,
+                        hk,
+                        q_len,
+                        cur_kv_len,
+                        alibi_slopes,
+                        batch_in_seq,
+                        sparse_attention_mask);
+                } else
+#    endif  // HAVE_AVX512F
 #    if defined(OPENVINO_ARCH_ARM64)
                 if constexpr (q_is_xf16) {
                     _helper.exec_kernel_multiple_kai(
