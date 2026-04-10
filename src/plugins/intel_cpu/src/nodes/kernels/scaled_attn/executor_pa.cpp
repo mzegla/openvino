@@ -709,8 +709,10 @@ struct MHAHelper {
         _use_flash_attn = g_flash_attn;
 #    if defined(HAVE_AVX512F)
         if (_use_flash_attn && !AarchF16) {
-            _flash_m.resize<float>({_nthr, _block_size});
-            _flash_l.resize<float>({_nthr, _block_size});
+            // _flash_m/_flash_l hold running state for every Q-head in the GQA group so that K/V
+            // packing can be amortised across all h_each_group_len heads per KV-block iteration.
+            _flash_m.resize<float>({_nthr, _h_each_group_len, _block_size});
+            _flash_l.resize<float>({_nthr, _h_each_group_len, _block_size});
             _flash_score.resize<float>({_nthr, _block_size, _block_size});
             _flash_k_scratch.resize<DATA_TYPE>({_nthr, _block_size * S});
             _flash_v_scratch.resize<DATA_TYPE>({_nthr, _block_size * rnd_up(SV, _block_size)});
@@ -1243,30 +1245,121 @@ struct MHAHelper {
         const auto q_cnt = q_end - q_start;
         const auto cur_kv_len_blocks = div_up(cur_kv_len, _block_size);
 
-        float* m_run = _flash_m.ptr<float>(ithr);
-        float* l_run = _flash_l.ptr<float>(ithr);
         float* score_tile = _flash_score.ptr<float>(ithr);  // [block_size, block_size] float
 
+        // ------------------------------------------------------------------
+        // Initialise running state for ALL heads in [hq_beg, hq_end).
+        // K/V will be packed once per KV-block and reused across all heads,
+        // eliminating the h_each_group_len× redundant packing cost for GQA.
+        // ------------------------------------------------------------------
         for (size_t h = hq_beg; h < hq_end; h++) {
-            // ------------------------------------------------------------------
-            // Initialise per-head running state
-            // ------------------------------------------------------------------
+            const size_t hi = h - hq_beg;
+            float* m_h = _flash_m.ptr<float>(ithr, hi, 0);
+            float* l_h = _flash_l.ptr<float>(ithr, hi, 0);
             for (size_t qi = 0; qi < q_cnt; qi++) {
-                m_run[qi] = -FLT_MAX;
-                l_run[qi] = 0.f;
+                m_h[qi] = -FLT_MAX;
+                l_h[qi] = 0.f;
                 memset(_output.ptr<float>(ithr, qi, h, 0), 0, SV * sizeof(float));
             }
-            float* fp32_out_ptr = _output.ptr<float>(ithr, 0, h, 0);
-            auto* q_ptr = query.ptr<DATA_TYPE>(h, q_start, 0);
+        }
 
-            for (size_t kv_blk = 0; kv_blk < cur_kv_len_blocks; kv_blk++) {
-                const auto block_number = block_table[kv_blk];
-                if (block_number < 0) {
+        for (size_t kv_blk = 0; kv_blk < cur_kv_len_blocks; kv_blk++) {
+            const auto block_number = block_table[kv_blk];
+            if (block_number < 0) {
+                continue;
+            }
+            const auto valid_kv = std::min(_block_size, cur_kv_len - kv_blk * _block_size);
+
+            // Sparse attention mask: skip if ALL heads in the group mask this tile.
+            // (conservative check: skip only if the first head masks it; per-head masking is
+            //  applied in the softmax loop below via -FLT_MAX.)
+            if (!sparse_attention_mask.empty() &&
+                sparse_attention_mask[batch_in_seq].ptr_v() != nullptr) {
+                if (!sparse_attention_mask[batch_in_seq].ptr<bool>(hq_beg, q_blk, kv_blk)[0]) {
                     continue;
                 }
-                const auto valid_kv = std::min(_block_size, cur_kv_len - kv_blk * _block_size);
+            }
 
-                // Sparse attention mask: skip tile if entirely masked
+            // Sliding window: skip blocks entirely before the window
+            if (_sliding_window > 0 && cur_kv_len > _sliding_window) {
+                const auto kv_blk_end = (kv_blk + 1) * _block_size;
+                if (kv_blk_end <= cur_kv_len - _sliding_window) {
+                    continue;
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // Pack K block ONCE for this KV-block (shared across all GQA heads).
+            // ------------------------------------------------------------------
+            auto* k_raw = present_key.ptr<typename ov::element_type_traits<KEY_PREC>::value_type,
+                                         KEY_PREC>(block_number, hk);
+            constexpr bool k_is_quantised = any_of(KEY_PREC, ov::element::u8, ov::element::u4);
+            DATA_TYPE* k_dequant_tmp = nullptr;
+            if constexpr (k_is_quantised) {
+                k_dequant_tmp = _flash_dequant_tmp.ptr<DATA_TYPE>(ithr);
+            }
+            transpose_16NxK<DATA_TYPE, KEY_PREC>(
+                _flash_k_scratch.ptr<DATA_TYPE>(ithr),
+                k_raw,
+                k_dequant_tmp,
+                valid_kv,
+                S,
+                _block_size,
+                _block_size,
+                S,
+                _params.key_group_size,
+                _params.quant_key_bychannel);
+
+            // ------------------------------------------------------------------
+            // Pack V block ONCE for this KV-block (shared across all GQA heads).
+            // ------------------------------------------------------------------
+            constexpr bool v_is_quantised = any_of(VALUE_PREC, ov::element::u8, ov::element::u4);
+            void* v_raw = present_value.ptr<typename ov::element_type_traits<VALUE_PREC>::value_type,
+                                           VALUE_PREC>(block_number, hk);
+            DATA_TYPE* v_ptr = nullptr;
+            if constexpr (q_is_xf16) {
+                DATA_TYPE* v_dequant_tmp = nullptr;
+                if constexpr (v_is_quantised) {
+                    v_dequant_tmp = _flash_dequant_tmp.ptr<DATA_TYPE>(ithr);
+                }
+                pack_32NxK<DATA_TYPE, VALUE_PREC>(
+                    _flash_v_scratch.ptr<DATA_TYPE>(ithr),
+                    v_raw,
+                    v_dequant_tmp,
+                    valid_kv,
+                    SV,
+                    _block_size,
+                    rnd_up(SV, _block_size),
+                    SV,
+                    _params.value_group_size,
+                    _params.quant_value_bychannel);
+                v_ptr = _flash_v_scratch.ptr<DATA_TYPE>(ithr);
+            } else if constexpr (v_is_quantised) {
+                dequant<DATA_TYPE, VALUE_PREC>(
+                    _flash_dequant_tmp.ptr<DATA_TYPE>(ithr),
+                    v_raw,
+                    valid_kv,
+                    SV,
+                    _block_size,
+                    _params.value_group_size,
+                    _params.quant_value_bychannel);
+                v_ptr = _flash_dequant_tmp.ptr<DATA_TYPE>(ithr);
+            } else {
+                v_ptr = present_value.ptr<DATA_TYPE>(block_number, hk);
+            }
+
+            // ------------------------------------------------------------------
+            // Inner head loop: QK GEMM + online softmax + WV GEMM for each
+            // Q-head in [hq_beg, hq_end), reusing the packed K and V above.
+            // ------------------------------------------------------------------
+            for (size_t h = hq_beg; h < hq_end; h++) {
+                const size_t hi = h - hq_beg;
+                float* m_h = _flash_m.ptr<float>(ithr, hi, 0);
+                float* l_h = _flash_l.ptr<float>(ithr, hi, 0);
+                float* fp32_out_ptr = _output.ptr<float>(ithr, 0, h, 0);
+                auto* q_ptr = query.ptr<DATA_TYPE>(h, q_start, 0);
+
+                // Per-head sparse mask check (individual heads may differ).
                 if (!sparse_attention_mask.empty() &&
                     sparse_attention_mask[batch_in_seq].ptr_v() != nullptr) {
                     if (!sparse_attention_mask[batch_in_seq].ptr<bool>(h, q_blk, kv_blk)[0]) {
@@ -1274,41 +1367,7 @@ struct MHAHelper {
                     }
                 }
 
-                // Sliding window: skip blocks entirely before the window
-                if (_sliding_window > 0 && cur_kv_len > _sliding_window) {
-                    const auto kv_blk_end = (kv_blk + 1) * _block_size;
-                    if (kv_blk_end <= cur_kv_len - _sliding_window) {
-                        continue;
-                    }
-                }
-
-                // --------------------------------------------------------------
-                // Pack K block into thread-local scratch (replicates the reorder
-                // phase but scoped to a single block for this thread).
-                // --------------------------------------------------------------
-                auto* k_raw = present_key.ptr<typename ov::element_type_traits<KEY_PREC>::value_type,
-                                             KEY_PREC>(block_number, hk);
-                // For quantised KEY_PREC (u8/u4): transpose_16NxK dequantises into tmp first.
-                constexpr bool k_is_quantised = any_of(KEY_PREC, ov::element::u8, ov::element::u4);
-                DATA_TYPE* k_dequant_tmp = nullptr;
-                if constexpr (k_is_quantised) {
-                    k_dequant_tmp = _flash_dequant_tmp.ptr<DATA_TYPE>(ithr);
-                }
-                transpose_16NxK<DATA_TYPE, KEY_PREC>(
-                    _flash_k_scratch.ptr<DATA_TYPE>(ithr),
-                    k_raw,
-                    k_dequant_tmp,
-                    valid_kv,
-                    S,
-                    _block_size,
-                    _block_size,  // dst_stride
-                    S,            // src_stride
-                    _params.key_group_size,
-                    _params.quant_key_bychannel);
-
-                // --------------------------------------------------------------
-                // QK GEMM: Q[q_cnt,S] x K[block_size,S]^T -> score_tile[q_cnt,block_size] (float)
-                // --------------------------------------------------------------
+                // QK GEMM: Q[q_cnt,S] x K^T[S,block_size] -> score_tile[q_cnt,block_size]
                 _qk_gemm_flash[q_cnt - 1]->executeGemm(
                     q_cnt < _block_size,
                     q_ptr,
@@ -1319,41 +1378,27 @@ struct MHAHelper {
                     _wsp.data() + ithr * _wsp_size_per_thread,
                     _qk_scratch_a ? _qk_scratch_a.ptr<DATA_TYPE>(ithr, 0) : nullptr);
 
-                // --------------------------------------------------------------
-                // Online softmax update per Q-row: update running (m, l, O_acc).
-                // --------------------------------------------------------------
+                // Online softmax update per Q-row.
+                const float alibi_slope = alibi_slopes ? alibi_slopes.ptr<float>()[h] : 0.f;
+                const int win_base = (_sliding_window > 0 && cur_kv_len > _sliding_window)
+                                         ? static_cast<int>(cur_kv_len - _sliding_window) -
+                                               static_cast<int>(kv_blk * _block_size)
+                                         : 0;
+
                 for (size_t qi = 0; qi < q_cnt; qi++) {
                     float* row = score_tile + qi * _block_size;
-
-                    // Causal exclusive upper-bound within this KV block
                     const int causal_end = static_cast<int>(cur_kv_len - q_cnt + qi + 1) -
                                            static_cast<int>(kv_blk * _block_size);
+                    const int win_start = std::max(win_base, 0);
 
-                    // Sliding window lower-bound within this KV block
-                    int win_start = 0;
-                    if (_sliding_window > 0 && cur_kv_len > _sliding_window) {
-                        win_start = static_cast<int>(cur_kv_len - _sliding_window) -
-                                    static_cast<int>(kv_blk * _block_size);
-                        if (win_start < 0) {
-                            win_start = 0;
-                        }
-                    }
-
-                    float alibi_slope = 0.f;
-                    if (alibi_slopes) {
-                        alibi_slope = alibi_slopes.ptr<float>()[h];
-                    }
-
-                    // Scale, apply alibi, mask invalid positions, find block max.
-                    float m_new = m_run[qi];
+                    float m_new = m_h[qi];
                     for (int k = 0; k < static_cast<int>(_block_size); k++) {
                         if (k >= win_start && k < causal_end && k < static_cast<int>(valid_kv)) {
                             float val = row[k] * _d_scale;
                             if (alibi_slope != 0.f) {
                                 const int abs_kv_pos = static_cast<int>(kv_blk * _block_size) + k;
-                                const int abs_q_pos = static_cast<int>(cur_kv_len) -
-                                                      static_cast<int>(q_cnt) +
-                                                      static_cast<int>(qi);
+                                const int abs_q_pos =
+                                    static_cast<int>(cur_kv_len - q_cnt + qi);
                                 val += alibi_slope * static_cast<float>(abs_kv_pos - abs_q_pos);
                             }
                             row[k] = val;
@@ -1363,102 +1408,61 @@ struct MHAHelper {
                         }
                     }
 
-                    // Rescale existing O accumulator for max shift.
-                    const float rescale = (m_run[qi] == -FLT_MAX) ? 0.f : std::exp(m_run[qi] - m_new);
+                    const float rescale = (m_h[qi] == -FLT_MAX) ? 0.f : std::exp(m_h[qi] - m_new);
                     if (rescale > 0.f && rescale != 1.f) {
                         float* o_row = _output.ptr<float>(ithr, qi, h, 0);
                         for (size_t sv = 0; sv < SV; sv++) {
                             o_row[sv] *= rescale;
                         }
                     }
-                    const float l_upd = (m_run[qi] == -FLT_MAX) ? 0.f : l_run[qi] * rescale;
+                    const float l_upd = (m_h[qi] == -FLT_MAX) ? 0.f : l_h[qi] * rescale;
 
-                    // Compute softmax numerators in-place; zero masked positions.
                     float block_sum = 0.f;
                     for (size_t k = 0; k < _block_size; k++) {
                         const float p = (row[k] > -FLT_MAX * 0.5f) ? std::exp(row[k] - m_new) : 0.f;
                         row[k] = p;
                         block_sum += p;
                     }
+                    m_h[qi] = m_new;
+                    l_h[qi] = l_upd + block_sum;
+                }
 
-                    m_run[qi] = m_new;
-                    l_run[qi] = l_upd + block_sum;
-                }  // per Q-row online softmax
-
-                // Convert score tile float -> DATA_TYPE in-place so the WV GEMM reads DATA_TYPE.
+                // Convert score tile float -> DATA_TYPE in-place (xf16 only).
                 if constexpr (q_is_xf16) {
                     for (size_t qi = 0; qi < q_cnt; qi++) {
                         float* row = score_tile + qi * _block_size;
-                        cvt_copy(reinterpret_cast<DATA_TYPE*>(row), row, 1, _block_size, _block_size, _block_size);
+                        cvt_copy(reinterpret_cast<DATA_TYPE*>(row),
+                                 row,
+                                 1,
+                                 _block_size,
+                                 _block_size,
+                                 _block_size);
                     }
                 }
 
-                // --------------------------------------------------------------
-                // V packing: xf16 uses pack_32NxK; f32 uses V directly or dequantises.
-                // For quantised VALUE_PREC (u8/u4), dequant tmp is passed to pack_32NxK (xf16)
-                // or dequant is called explicitly (f32).
-                // --------------------------------------------------------------
-                constexpr bool v_is_quantised = any_of(VALUE_PREC, ov::element::u8, ov::element::u4);
-                void* v_raw = present_value.ptr<typename ov::element_type_traits<VALUE_PREC>::value_type,
-                                               VALUE_PREC>(block_number, hk);
-                DATA_TYPE* v_ptr = nullptr;
-                if constexpr (q_is_xf16) {
-                    // pack_32NxK handles both quantised and non-quantised VALUE_PREC;
-                    // it needs a tmp buffer when dequantising.
-                    DATA_TYPE* v_dequant_tmp = nullptr;
-                    if constexpr (v_is_quantised) {
-                        v_dequant_tmp = _flash_dequant_tmp.ptr<DATA_TYPE>(ithr);
-                    }
-                    pack_32NxK<DATA_TYPE, VALUE_PREC>(
-                        _flash_v_scratch.ptr<DATA_TYPE>(ithr),
-                        v_raw,
-                        v_dequant_tmp,
-                        valid_kv,
-                        SV,
-                        _block_size,
-                        rnd_up(SV, _block_size),  // dst_stride
-                        SV,                       // src_stride
-                        _params.value_group_size,
-                        _params.quant_value_bychannel);
-                    v_ptr = _flash_v_scratch.ptr<DATA_TYPE>(ithr);
-                } else if constexpr (v_is_quantised) {
-                    // f32 DATA_TYPE with quantised V: dequantise into the shared dequant tmp buffer.
-                    // dequant zero-pads rows N..block_size, matching the non-quantised behaviour.
-                    dequant<DATA_TYPE, VALUE_PREC>(
-                        _flash_dequant_tmp.ptr<DATA_TYPE>(ithr),
-                        v_raw,
-                        valid_kv,
-                        SV,
-                        _block_size,
-                        _params.value_group_size,
-                        _params.quant_value_bychannel);
-                    v_ptr = _flash_dequant_tmp.ptr<DATA_TYPE>(ithr);
-                } else {
-                    // f32 DATA_TYPE, non-quantised V: use directly (row-major [block_size, SV]).
-                    v_ptr = present_value.ptr<DATA_TYPE>(block_number, hk);
-                }
-
-                // --------------------------------------------------------------
-                // WV accumulate: score_tile[q_cnt,block_size] x V[block_size,SV] -> fp32_out_ptr
-                // Always accumulate (O_acc initialised to zero above per head).
-                // --------------------------------------------------------------
+                // WV accumulate GEMM (packed V reused from outer scope).
                 _wv_gemm_acc_flash[q_cnt - 1]->executeGemm(
                     q_cnt < _block_size,
-                    reinterpret_cast<DATA_TYPE*>(score_tile),  // A: score tile as DATA_TYPE
-                    v_ptr,                                     // B: V block
-                    fp32_out_ptr,                              // C: fp32 accumulator
+                    reinterpret_cast<DATA_TYPE*>(score_tile),
+                    v_ptr,
+                    fp32_out_ptr,
                     nullptr,
                     nullptr,
                     _wsp.data() + ithr * _wsp_size_per_thread,
                     nullptr);
-            }  // kv_blk loop
+            }  // inner head loop
+        }  // kv_blk loop
 
-            // ------------------------------------------------------------------
-            // Normalise O accumulator by l_run, then write to output_emb.
-            // ------------------------------------------------------------------
+        // ------------------------------------------------------------------
+        // Normalise and write output for all heads in [hq_beg, hq_end).
+        // ------------------------------------------------------------------
+        for (size_t h = hq_beg; h < hq_end; h++) {
+            const size_t hi = h - hq_beg;
+            float* l_h = _flash_l.ptr<float>(ithr, hi, 0);
+
             for (size_t qi = 0; qi < q_cnt; qi++) {
-                if (l_run[qi] > 0.f) {
-                    const float inv_l = 1.f / l_run[qi];
+                if (l_h[qi] > 0.f) {
+                    const float inv_l = 1.f / l_h[qi];
                     float* o_row = _output.ptr<float>(ithr, qi, h, 0);
                     for (size_t sv = 0; sv < SV; sv++) {
                         o_row[sv] *= inv_l;
@@ -1482,7 +1486,7 @@ struct MHAHelper {
                            SV * sizeof(float));
                 }
             }
-        }  // head loop
+        }  // output write loop
     }
 #    endif  // HAVE_AVX512F (flash prefill)
 
@@ -1940,16 +1944,38 @@ struct MHA {
         _helper.init_reorder_buffers(_workitems.get_reorder_max_batch_size(),
                                      div_up(_workitems.get_reorder_max_kv_len(), _helper._block_size));
 
-        // Flash attention path: non-sage, x86 AVX-512 only, no image-token VLM attention.
-        // Supports both non-quantised (f32/bf16/f16) and quantised (u8/u4) K/V caches.
-        // i8 KEY_PREC is SageAttn and is already excluded by !is_sage_attn.
+        // Compute loop_hk here so it is in scope for the use_flash guard below.
+        // loop along HK dimension: if mixed first/second token and elements count is enough, loop HK to reuse KV in the
+        // CPU cache
+        //    else if elements count is small, prefer to loop H to get more work to avoid thread imbalance
+        bool loop_hk = _workitems.get_reorder_max_batch_size() == past_lens.m_dims[0] ||  // if only first token, loop H
+                               attn_work_count * Hk <= 2 * _helper._nthr
+                           ? false
+                           : true;  // or less than 2 work items per thread, loop H
+
+        // Flash attention path: non-quantised, non-sage, x86 AVX-512 only, no image-token VLM attention.
+        // Quantised K/V (u8/u4) is excluded: the flash path dequantises each KV block independently
+        // per Q-block work item, whereas the non-flash reorder phase dequantises each block once and
+        // shares the result across all Q-blocks — making flash 8× or more expensive for quantised models.
+        //
+        // GQA exclusion when loop_hk=false: with loop_hk=false the attn kernel iterates over individual
+        // Q-heads (H work items). Each work item independently packs all KV blocks for its head, but the
+        // same KV data is also packed by every other head in the same GQA group — h_each_group_len×
+        // redundancy. The restructured exec_kernel_flash_prefill only amortises K/V packing when all
+        // heads of the group are processed by the same work item (loop_hk=true), but forcing loop_hk=true
+        // collapses work items from (q_blocks×H) to (q_blocks×Hk), killing thread utilisation on SPR.
+        // Disable flash when h_each_group_len>1 and loop_hk=false.
         // When active the reorder phase is skipped; K/V are packed on-the-fly per thread.
 #    if defined(HAVE_AVX512F)
+        constexpr bool keyval_is_quantised =
+            any_of(KEY_PREC, ov::element::u8, ov::element::u4, ov::element::i8) ||
+            any_of(VALUE_PREC, ov::element::u8, ov::element::u4);
         const bool use_flash = _helper._use_flash_attn && !_helper._params.is_sage_attn &&
-                               !_helper._has_image_tokens &&
+                               !keyval_is_quantised && !_helper._has_image_tokens &&
                                !_helper._qk_gemm_flash.empty() &&
                                (_helper._sparse_mask_block_size == 0 ||
-                                _helper._sparse_mask_block_size == _helper._block_size);
+                                _helper._sparse_mask_block_size == _helper._block_size) &&
+                               !(loop_hk == false && _helper._h_each_group_len > 1);
 #    else
         const bool use_flash = false;
 #    endif
@@ -2051,13 +2077,6 @@ struct MHA {
         });
         }  // if (!use_flash)
 
-        // loop along HK dimension: if mixed first/second token and elements count is enough, loop HK to reuse KV in the
-        // CPU cache
-        //    else if elements count is small, prefer to loop H to get more work to avoid thread imbalance
-        bool loop_hk = _workitems.get_reorder_max_batch_size() == past_lens.m_dims[0] ||  // if only first token, loop H
-                               attn_work_count * Hk <= 2 * _helper._nthr
-                           ? false
-                           : true;  // or less than 2 work items per thread, loop H
         auto weight_h = loop_hk ? _helper.H / Hk : 1;
         _helper.resize_temporary_weight_buffer(weight_h);
         // attn_work_count num_sub_seq
