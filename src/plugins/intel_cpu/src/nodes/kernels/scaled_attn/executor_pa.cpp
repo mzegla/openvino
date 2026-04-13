@@ -2180,29 +2180,41 @@ struct MHA {
                            ? false
                            : true;  // or less than 2 work items per thread, loop H
 
+        // attn_loop_hk: controls how the attention-phase parallel loop is split (Hk vs H dimension).
+        // Normally mirrors loop_hk, but for flash attention + GQA we may override it to true so that
+        // exec_kernel_flash_prefill can amortise on-the-fly K/V packing over the full GQA head group.
+        // The reorder phase always uses the original loop_hk; only the attention dispatch uses attn_loop_hk.
+        bool attn_loop_hk = loop_hk;
+
         // Flash attention path: non-quantised, non-sage, x86 AVX-512 only, no image-token VLM attention.
         // Quantised K/V (u8/u4) is excluded: the flash path dequantises each KV block independently
         // per Q-block work item, whereas the non-flash reorder phase dequantises each block once and
         // shares the result across all Q-blocks — making flash 8× or more expensive for quantised models.
         //
-        // GQA exclusion when loop_hk=false: with loop_hk=false the attn kernel iterates over individual
-        // Q-heads (H work items). Each work item independently packs all KV blocks for its head, but the
-        // same KV data is also packed by every other head in the same GQA group — h_each_group_len×
-        // redundancy. The restructured exec_kernel_flash_prefill only amortises K/V packing when all
-        // heads of the group are processed by the same work item (loop_hk=true), but forcing loop_hk=true
-        // collapses work items from (q_blocks×H) to (q_blocks×Hk), killing thread utilisation on SPR.
-        // Disable flash when h_each_group_len>1 and loop_hk=false.
+        // GQA with loop_hk=false: the standard loop dispatches H work items where each processes one
+        // Q-head independently. For GQA this causes h_each_group_len× redundant K/V packing.
+        // Fix: when flash is active and GQA > 1, override attn_loop_hk=true so exec_kernel_flash_prefill
+        // groups h_each_group_len Q-heads per work item (one K/V packing amortised over all group heads).
+        // Guard: only override when attn_work_count*Hk > 2*nthr so thread utilisation stays healthy.
+        // Note: the "pure prefill" condition that forces loop_hk=false does not apply here because
+        // flash skips the reorder phase entirely — loop_hk's reorder-batch constraint is irrelevant.
         // When active the reorder phase is skipped; K/V are packed on-the-fly per thread.
 #    if defined(HAVE_AVX512F)
         constexpr bool keyval_is_quantised =
             any_of(KEY_PREC, ov::element::u8, ov::element::u4, ov::element::i8) ||
             any_of(VALUE_PREC, ov::element::u8, ov::element::u4);
+        if (_helper._use_flash_attn && !_helper._params.is_sage_attn && !keyval_is_quantised &&
+            !_helper._has_image_tokens && !_helper._qk_gemm_flash.empty() &&
+            !loop_hk && _helper._h_each_group_len > 1 && attn_work_count * Hk > 2 * _helper._nthr) {
+            // Force Hk-grouped dispatch so flash can pack K/V once per KV-block for all GQA heads.
+            attn_loop_hk = true;
+        }
         const bool use_flash = _helper._use_flash_attn && !_helper._params.is_sage_attn &&
                                !keyval_is_quantised && !_helper._has_image_tokens &&
                                !_helper._qk_gemm_flash.empty() &&
                                (_helper._sparse_mask_block_size == 0 ||
                                 _helper._sparse_mask_block_size == _helper._block_size) &&
-                               !(loop_hk == false && _helper._h_each_group_len > 1);
+                               !(attn_loop_hk == false && _helper._h_each_group_len > 1);
 #    else
         const bool use_flash = false;
 #    endif
@@ -2319,14 +2331,14 @@ struct MHA {
         });
         }  // if (!use_flash)
 
-        auto weight_h = loop_hk ? _helper.H / Hk : 1;
+        auto weight_h = attn_loop_hk ? _helper.H / Hk : 1;
         _helper.resize_temporary_weight_buffer(weight_h);
         // attn_work_count num_sub_seq
-        parallel_for2d_dynamic(attn_work_count, loop_hk ? Hk : _helper.H, [&](size_t w, size_t hx) {
+        parallel_for2d_dynamic(attn_work_count, attn_loop_hk ? Hk : _helper.H, [&](size_t w, size_t hx) {
             size_t hk = 0;
             size_t hq_beg = 0;
             size_t hq_end = 0;
-            if (loop_hk) {
+            if (attn_loop_hk) {
                 hk = hx;
                 hq_beg = hk * _helper._h_each_group_len;
                 hq_end = (hk + 1) * _helper._h_each_group_len;
