@@ -1488,7 +1488,234 @@ struct MHAHelper {
             }
         }  // output write loop
     }
-#    endif  // HAVE_AVX512F (flash prefill)
+
+    // Flash-attention prefill using K/V that are already packed by the reorder phase.
+    // Unlike exec_kernel_flash_prefill (which skips reorder entirely and packs K/V on-the-fly),
+    // this function reads from _qk_scratch_b / _wv_scratch_b which were populated once per
+    // (kv_block × Hk) by the reorder phase — so amortisation is free for any GQA ratio, and
+    // quantised K/V is supported because the reorder phase has already dequantised and packed.
+    //
+    // Trade-off vs exec_kernel_multiple: replaces the kv_len-wide _weight buffer (O(context_len))
+    // with the fixed-size _flash_score tile (O(block_size²)), reducing peak memory by ~290 MB at
+    // 8K context on a 56-thread machine with GQA=5.
+    //
+    // Restrictions (enforced by the use_flash_from_scratch guard in exec_loop_mixed):
+    //   - x86 AVX-512 only
+    //   - non-sage (sage uses a different K packing layout in qk_scratch_b)
+    //   - no image-token bidirectional attention
+    //   - score_output not yet supported (falls through to exec_kernel_multiple when needed)
+    //
+    //  query        : [H, q_len, S]   (permuted view; physical stride between Q rows is H*S)
+    //  present_value: [block_number, Hk, block_size, SV]  — only used for f32/f32 same-type path
+    //  output_emb   : [q_len, H * SV]
+    //  qk_scratch_b : [1, kv_blocks, Hk, block_size * S]  sliced to batch_in_reorder
+    //  wv_scratch_b : [1, kv_blocks, Hk, block_size * rnd_up(SV, block_size)]  sliced
+    //  block_table  : [cur_kv_len_blocks]  — for the f32 V-from-cache fallback
+    void exec_kernel_flash_from_scratch_b(const PlainTensor& query,
+                                          const PlainTensor& present_value,
+                                          const PlainTensor& output_emb,
+                                          const PlainTensor& qk_scratch_b,
+                                          const PlainTensor& wv_scratch_b,
+                                          const int32_t* block_table,
+                                          size_t ithr,
+                                          size_t q_blk,
+                                          size_t hq_beg,
+                                          size_t hq_end,
+                                          size_t hk,
+                                          size_t q_len,
+                                          size_t cur_kv_len,
+                                          const PlainTensor& alibi_slopes,
+                                          size_t batch_in_seq,
+                                          const std::vector<PlainTensor>& sparse_attention_mask) {
+        constexpr bool q_is_xf16 = any_of(precision_of<DATA_TYPE>::value, ov::element::bf16, ov::element::f16);
+        constexpr bool q_cache_is_same = precision_of<DATA_TYPE>::value == VALUE_PREC;
+
+        const auto q_start = q_blk * _block_size;
+        const auto q_end = std::min(q_start + _block_size, q_len);
+        const auto q_cnt = q_end - q_start;
+        const auto cur_kv_len_blocks = div_up(cur_kv_len, _block_size);
+
+        float* score_tile = _flash_score.ptr<float>(ithr);  // [block_size, block_size] float
+
+        // Sparse mask bookkeeping (mirrors exec_kernel_multiple).
+        [[maybe_unused]] size_t sparse_scale = 1;
+        [[maybe_unused]] std::function<std::pair<size_t, size_t>(size_t, size_t)> map_to_mask_idx =
+            [](size_t q_blk_rt, size_t k_blk_rt) {
+                return std::pair<size_t, size_t>{q_blk_rt, k_blk_rt};
+            };
+        if (!sparse_attention_mask.empty()) {
+            if (!(_sparse_mask_block_size == 0 || _sparse_mask_block_size == _block_size)) {
+                sparse_scale = _sparse_mask_block_size / _block_size;
+                map_to_mask_idx = [sparse_scale](size_t q_blk_rt, size_t k_blk_rt) {
+                    return std::pair<size_t, size_t>{q_blk_rt / sparse_scale, k_blk_rt / sparse_scale};
+                };
+            }
+        }
+
+        // Process one head at a time (head-outer, KV-inner).
+        // Unlike exec_kernel_flash_prefill we do not need KV-outer order to amortise packing —
+        // the reorder phase has already done that — so head-outer is simpler and equally efficient.
+        for (size_t h = hq_beg; h < hq_end; h++) {
+            // Use slot 0 of the h_each_group_len dimension since we process one head at a time.
+            float* m_h = _flash_m.ptr<float>(ithr, 0, 0);
+            float* l_h = _flash_l.ptr<float>(ithr, 0, 0);
+            float* fp32_out_ptr = _output.ptr<float>(ithr, 0, h, 0);
+            auto* q_ptr = query.ptr<DATA_TYPE>(h, q_start, 0);
+
+            // Initialise running state.
+            for (size_t qi = 0; qi < q_cnt; qi++) {
+                m_h[qi] = -FLT_MAX;
+                l_h[qi] = 0.f;
+                memset(_output.ptr<float>(ithr, qi, h, 0), 0, SV * sizeof(float));
+            }
+
+            for (size_t kv_blk = 0; kv_blk < cur_kv_len_blocks; kv_blk++) {
+                // Sparse attention mask check (per-head).
+                if (!sparse_attention_mask.empty() && sparse_attention_mask[batch_in_seq].ptr_v() != nullptr) {
+                    auto [q_m, k_m] = map_to_mask_idx(q_blk, kv_blk);
+                    if (!sparse_attention_mask[batch_in_seq].ptr<bool>(h, q_m, k_m)[0]) {
+                        continue;
+                    }
+                }
+
+                // Sliding window: skip blocks that are entirely before the window.
+                if (_sliding_window > 0 && cur_kv_len > _sliding_window) {
+                    const auto kv_blk_end = (kv_blk + 1) * _block_size;
+                    if (kv_blk_end <= cur_kv_len - _sliding_window) {
+                        continue;
+                    }
+                }
+
+                const auto valid_kv = std::min(_block_size, cur_kv_len - kv_blk * _block_size);
+
+                // K is pre-packed in qk_scratch_b by the reorder phase — no packing needed here.
+                auto* k_ptr = qk_scratch_b.ptr<DATA_TYPE>(kv_blk, hk);
+
+                // QK GEMM: Q[q_cnt, S] × K^T[S, block_size] → score_tile[q_cnt, block_size]
+                _qk_gemm_flash[q_cnt - 1]->executeGemm(
+                    q_cnt < _block_size,
+                    q_ptr,
+                    k_ptr,
+                    score_tile,
+                    nullptr,
+                    nullptr,
+                    _wsp.data() + ithr * _wsp_size_per_thread,
+                    _qk_scratch_a ? _qk_scratch_a.ptr<DATA_TYPE>(ithr, 0) : nullptr);
+
+                // Online softmax update — same logic as exec_kernel_flash_prefill.
+                const float alibi_slope = alibi_slopes ? alibi_slopes.ptr<float>()[h] : 0.f;
+                const int win_base =
+                    (_sliding_window > 0 && cur_kv_len > _sliding_window)
+                        ? static_cast<int>(cur_kv_len - _sliding_window) -
+                              static_cast<int>(kv_blk * _block_size)
+                        : 0;
+
+                for (size_t qi = 0; qi < q_cnt; qi++) {
+                    float* row = score_tile + qi * _block_size;
+                    const int causal_end = static_cast<int>(cur_kv_len - q_cnt + qi + 1) -
+                                           static_cast<int>(kv_blk * _block_size);
+                    const int win_start = std::max(win_base, 0);
+
+                    float m_new = m_h[qi];
+                    for (int k = 0; k < static_cast<int>(_block_size); k++) {
+                        if (k >= win_start && k < causal_end && k < static_cast<int>(valid_kv)) {
+                            float val = row[k] * _d_scale;
+                            if (alibi_slope != 0.f) {
+                                const int abs_kv_pos = static_cast<int>(kv_blk * _block_size) + k;
+                                const int abs_q_pos = static_cast<int>(cur_kv_len - q_cnt + qi);
+                                val += alibi_slope * static_cast<float>(abs_kv_pos - abs_q_pos);
+                            }
+                            row[k] = val;
+                            m_new = std::max(m_new, val);
+                        } else {
+                            row[k] = -FLT_MAX;
+                        }
+                    }
+
+                    const float rescale = (m_h[qi] == -FLT_MAX) ? 0.f : std::exp(m_h[qi] - m_new);
+                    if (rescale > 0.f && rescale != 1.f) {
+                        float* o_row = _output.ptr<float>(ithr, qi, h, 0);
+                        for (size_t sv = 0; sv < SV; sv++) {
+                            o_row[sv] *= rescale;
+                        }
+                    }
+                    const float l_upd = (m_h[qi] == -FLT_MAX) ? 0.f : l_h[qi] * rescale;
+
+                    float block_sum = 0.f;
+                    for (size_t k = 0; k < _block_size; k++) {
+                        const float p = (row[k] > -FLT_MAX * 0.5f) ? std::exp(row[k] - m_new) : 0.f;
+                        row[k] = p;
+                        block_sum += p;
+                    }
+                    m_h[qi] = m_new;
+                    l_h[qi] = l_upd + block_sum;
+                }
+
+                // Convert score tile float → DATA_TYPE in-place (xf16 only).
+                if constexpr (q_is_xf16) {
+                    for (size_t qi = 0; qi < q_cnt; qi++) {
+                        float* row = score_tile + qi * _block_size;
+                        cvt_copy(reinterpret_cast<DATA_TYPE*>(row),
+                                 row,
+                                 1,
+                                 _block_size,
+                                 _block_size,
+                                 _block_size);
+                    }
+                }
+
+                // V pointer: use pre-packed wv_scratch_b (xf16 or non-native V type), or read
+                // directly from the KV cache (f32/f32 same-type, already zero-padded by reorder).
+                DATA_TYPE* v_ptr;
+                if constexpr (q_is_xf16 || !q_cache_is_same) {
+                    v_ptr = wv_scratch_b.ptr<DATA_TYPE>(kv_blk, hk);
+                } else {
+                    // For f32/f32, the reorder phase zero-pads unused slots in-place in the cache.
+                    v_ptr = present_value.ptr<DATA_TYPE>(block_table[kv_blk], hk);
+                }
+
+                // WV accumulate GEMM: weight[q_cnt, block_size] × V[block_size, SV] → O[q_cnt, SV]
+                _wv_gemm_acc_flash[q_cnt - 1]->executeGemm(
+                    q_cnt < _block_size,
+                    reinterpret_cast<DATA_TYPE*>(score_tile),
+                    v_ptr,
+                    fp32_out_ptr,
+                    nullptr,
+                    nullptr,
+                    _wsp.data() + ithr * _wsp_size_per_thread,
+                    nullptr);
+            }  // kv_blk loop
+
+            // Normalise and write output for this head.
+            for (size_t qi = 0; qi < q_cnt; qi++) {
+                if (l_h[qi] > 0.f) {
+                    const float inv_l = 1.f / l_h[qi];
+                    float* o_row = _output.ptr<float>(ithr, qi, h, 0);
+                    for (size_t sv = 0; sv < SV; sv++) {
+                        o_row[sv] *= inv_l;
+                    }
+                }
+            }
+
+            if constexpr (q_is_xf16) {
+                attn_memcpy2d_kernel(_output.ptr<float>(ithr, 0, h, 0),
+                                     output_emb.ptr<DATA_TYPE>(q_start, h * SV),
+                                     ov::element::f32,
+                                     precision_of<DATA_TYPE>::value,
+                                     _output.stride(1),
+                                     output_emb.stride(0),
+                                     SV,
+                                     q_cnt);
+            } else {
+                for (size_t qi = 0; qi < q_cnt; qi++) {
+                    memcpy(output_emb.ptr<DATA_TYPE>(q_start + qi, h * SV),
+                           _output.ptr<float>(ithr, qi, h, 0),
+                           SV * sizeof(float));
+                }
+            }
+        }  // head loop
+    }
+#    endif  // HAVE_AVX512F (flash prefill and flash from scratch_b)
 
     // compute one token, loop along batch and head dimensions
     // all tensors such as query... have no batch dimension because batch dimension is varying
@@ -1980,6 +2207,21 @@ struct MHA {
         const bool use_flash = false;
 #    endif
 
+        // Flash path that reads from the reorder-produced scratch buffers (_qk_scratch_b / _wv_scratch_b).
+        // Unlike use_flash (which skips reorder), this path runs AFTER the reorder phase and replaces
+        // the kv_len-wide _weight buffer with an O(block_size²) score tile via online softmax.
+        // This removes all GQA and quantisation restrictions — the reorder phase handles amortisation.
+#    if defined(HAVE_AVX512F)
+        const bool use_flash_from_scratch = !use_flash && _helper._use_flash_attn &&
+                                            !_helper._params.is_sage_attn &&
+                                            !_helper._has_image_tokens &&
+                                            !_helper._qk_gemm_flash.empty() &&
+                                            (_helper._sparse_mask_block_size == 0 ||
+                                             _helper._sparse_mask_block_size == _helper._block_size);
+#    else
+        const bool use_flash_from_scratch = false;
+#    endif
+
         // packed k, v  (skipped when flash attention is active)
         if (!use_flash) {
         parallel_for2d_dynamic(reorder_work_count, Hk, [&](size_t w, size_t hk) {
@@ -2167,6 +2409,25 @@ struct MHA {
                         v_cache,
                         output_emb.slice(0, batch_in_token, batch_in_token + q_len)
                             .reshape({q_len, _helper.H * _helper.SV}),
+                        block_indices.ptr<int32_t>() + block_indices_begins.ptr<int32_t>()[batch_in_seq],
+                        ithr,
+                        q_blk,
+                        hq_beg,
+                        hq_end,
+                        hk,
+                        q_len,
+                        cur_kv_len,
+                        alibi_slopes,
+                        batch_in_seq,
+                        sparse_attention_mask);
+                } else if (use_flash_from_scratch && score_output == nullptr) {
+                    _helper.exec_kernel_flash_from_scratch_b(
+                        sub_query,
+                        v_cache,
+                        output_emb.slice(0, batch_in_token, batch_in_token + q_len)
+                            .reshape({q_len, _helper.H * _helper.SV}),
+                        _helper._qk_scratch_b.slice(0, batch_in_reorder, batch_in_reorder),
+                        _helper._wv_scratch_b.slice(0, batch_in_reorder, batch_in_reorder),
                         block_indices.ptr<int32_t>() + block_indices_begins.ptr<int32_t>()[batch_in_seq],
                         ithr,
                         q_blk,
